@@ -191,11 +191,10 @@ impl VaultPolicy {
                 let delay_script_num = bitcoin::script::Builder::new()
                     .push_int(i64::from(delay))
                     .into_script();
-                if !script
-                    .as_bytes()
-                    .windows(delay_script_num.len())
-                    .any(|window| window == delay_script_num.as_bytes())
-                {
+                // The CSV delay is always the first element of a recovery script. Anchoring the
+                // comparison keeps a 32-byte pubkey that happens to contain the other path's
+                // encoded delay from hijacking this lookup.
+                if !script.as_bytes().starts_with(delay_script_num.as_bytes()) {
                     continue;
                 }
             }
