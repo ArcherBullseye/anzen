@@ -33,9 +33,48 @@ pub struct VaultConfig {
     pub emergency_access_limit_sats: u64,
 }
 
+/// The only `VaultConfig` layout this build understands.
+pub const CONFIG_VERSION: u8 = 1;
+
 impl VaultConfig {
     pub fn bitcoin_network(&self) -> Result<Network> {
         parse_network_name(&self.network)
+    }
+
+    /// Recompute the vault policy from the two device keys and require the stored copy to match.
+    ///
+    /// Anzen has exactly one vault script, so the descriptor and address are fully determined by
+    /// `phone_vault_pubkey` and `hww_vault_pubkey`. Storing them as strings and reading them back
+    /// unchecked would let anyone who can write this file substitute a different Taproot tree —
+    /// one that keeps the cooperative leaf, so signing and verification still succeed, while
+    /// adding a leaf that spends unilaterally. Every consumer of the config builds its signing
+    /// policy from `vault_descriptor`, so this has to be checked where the config is loaded.
+    pub fn validate_policy_binding(&self) -> Result<()> {
+        if self.version != CONFIG_VERSION {
+            bail!("unsupported vault config version {}", self.version);
+        }
+        if self.phone_recovery_blocks != PHONE_RECOVERY_BLOCKS
+            || self.hww_recovery_blocks != HWW_RECOVERY_BLOCKS
+        {
+            bail!(
+                "vault config recovery delays ({}, {}) are not the Anzen policy ({PHONE_RECOVERY_BLOCKS}, {HWW_RECOVERY_BLOCKS})",
+                self.phone_recovery_blocks,
+                self.hww_recovery_blocks
+            );
+        }
+        let network = self.bitcoin_network()?;
+        let phone = XOnlyPublicKey::from_str(&self.phone_vault_pubkey)
+            .context("vault config has an invalid phone vault key")?;
+        let hww = XOnlyPublicKey::from_str(&self.hww_vault_pubkey)
+            .context("vault config has an invalid HWW vault key")?;
+        let expected = VaultPolicy::new_for_network(phone, hww, network)?;
+        if self.vault_descriptor != expected.descriptor_string() {
+            bail!("vault config descriptor is not the Anzen policy for its configured device keys");
+        }
+        if self.vault_address != expected.address.to_string() {
+            bail!("vault config address does not match its descriptor");
+        }
+        Ok(())
     }
 }
 
@@ -139,7 +178,9 @@ pub fn initialize_vault_for_network(data_dir: &Path, network: Network) -> Result
 }
 
 pub fn load_config(data_dir: &Path) -> Result<VaultConfig> {
-    read_json(&config_path(data_dir))
+    let config: VaultConfig = read_json(&config_path(data_dir))?;
+    config.validate_policy_binding()?;
+    Ok(config)
 }
 
 pub fn config_exists(data_dir: &Path) -> bool {
