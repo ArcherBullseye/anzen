@@ -584,11 +584,31 @@ pub fn validate_batch(
         bail!("rollover remainder does not match its manifest");
     }
 
+    // Re-derive the monthly schedule rather than trusting the timestamps the proposal carries.
+    // Every authorization's nLockTime is compared against `month.unlock_timestamp` below, but
+    // that field arrives in the proposal itself: without an independent expectation the check
+    // would only confirm the proposal agrees with itself, and a phone could hand the HWW twelve
+    // authorizations that all matured in the past.
+    let created_at = DateTime::<Utc>::from_timestamp(manifest.created_at, 0)
+        .context("policy manifest has an invalid creation time")?;
+    let expected_schedule = next_month_starts(created_at, manifest.chunk_count)?;
+
     for (index, month) in manifest.months.iter().enumerate() {
         if month.chunk_vout != index as u32
             || month.chunk_value_sats != rollover_tx.output[index].value.to_sat()
         {
             bail!("month {} does not match its rollover chunk", month.month);
+        }
+        let (expected_month, expected_unlock) = &expected_schedule[index];
+        if month.month != *expected_month || month.unlock_timestamp != *expected_unlock {
+            bail!(
+                "month {} does not match the approved schedule: expected {} unlocking at {}, got {} unlocking at {}",
+                index + 1,
+                expected_month,
+                expected_unlock,
+                month.month,
+                month.unlock_timestamp
+            );
         }
         let expected_outpoint = OutPoint::new(rollover_tx.compute_txid(), index as u32);
         let hot_script = Address::from_str(&month.hot_address)?
@@ -603,6 +623,9 @@ pub fn validate_batch(
         )?;
         let auth_tx = &authorization.unsigned_tx;
         if auth_tx.lock_time.to_consensus_u32() != month.unlock_timestamp
+            // A locktime below the BIP65 threshold is a block height, not a date. Rejecting it
+            // explicitly keeps a height-based lock from ever standing in for a calendar month.
+            || !auth_tx.lock_time.is_block_time()
             || auth_tx.input[0].sequence != Sequence::ENABLE_LOCKTIME_NO_RBF
             || auth_tx.output.len() != 1
             || auth_tx.output[0].value.to_sat() != manifest.monthly_limit_sats

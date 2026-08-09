@@ -1011,6 +1011,12 @@ fn run_node(command: NodeCommand, rpc_args: &ChainArgs, network: Network) -> Res
     Ok(())
 }
 
+fn format_unlock(unlock_timestamp: u32) -> String {
+    chrono::DateTime::from_timestamp(i64::from(unlock_timestamp), 0)
+        .map(|moment| moment.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| format!("unix time {unlock_timestamp}"))
+}
+
 fn print_manifest(manifest: &core::ceremony::BatchManifest, stderr: bool) -> Result<()> {
     let mut output: Box<dyn Write> = if stderr {
         Box::new(io::stderr().lock())
@@ -1070,6 +1076,22 @@ fn print_manifest(manifest: &core::ceremony::BatchManifest, stderr: bool) -> Res
             output,
             "Rollover remainder: {} sats",
             manifest.remainder_value_sats
+        )?;
+        // The maturity schedule is the part of the policy that decides *when* money can move,
+        // so it belongs on the approval screen next to the amounts.
+        let first = &manifest.months[0];
+        let last = &manifest.months[manifest.months.len() - 1];
+        writeln!(
+            output,
+            "First allowance: {} unlocks {}",
+            first.month,
+            format_unlock(first.unlock_timestamp)
+        )?;
+        writeln!(
+            output,
+            "Last allowance:  {} unlocks {}",
+            last.month,
+            format_unlock(last.unlock_timestamp)
         )?;
     }
     if let Some(emergency) = &manifest.emergency_access {
