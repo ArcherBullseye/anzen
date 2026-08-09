@@ -368,6 +368,13 @@ fn archive_old_epoch(data_dir: &Path, old_config: &VaultConfig, txid: bitcoin::T
         PathBuf::from("phone/hot-wallet.sqlite-wal"),
         PathBuf::from("phone/hot-wallet.sqlite-shm"),
         PathBuf::from("phone/hot-wallet.sqlite"),
+        // The rotation sweep has only been broadcast, not confirmed. Until it is mined the
+        // funds are still in the old vault, and reaching them cooperatively or by phone
+        // recovery needs the old phone key, so move it into the archive instead of letting the
+        // caller overwrite it. Same for the cloud backup, which wraps that key for the HWW and
+        // for any recovery friends. Once the sweep confirms these control nothing.
+        PathBuf::from(PHONE_DEVICE_FILE),
+        PathBuf::from(PHONE_BACKUP_FILE),
     ] {
         let source = data_dir.join(&relative);
         if !source.exists() {
