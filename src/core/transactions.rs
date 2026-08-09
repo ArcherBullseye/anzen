@@ -34,6 +34,26 @@ pub fn create_vault_psbt(
     Ok(psbt)
 }
 
+/// Anzen only ever signs `SIGHASH_DEFAULT`, which commits to every input and output.
+///
+/// The sighash used to build the message comes from the PSBT input's own `sighash_type`, and
+/// a PSBT is supplied by whoever proposes the spend. Any other type — `SIGHASH_NONE` above all,
+/// which commits to no outputs — would let the proposer move the money somewhere else after the
+/// other device has co-signed, so refuse it before producing a signature.
+fn ensure_default_sighash(psbt: &Psbt, index: usize) -> Result<()> {
+    // An absent sighash type means SIGHASH_DEFAULT under BIP341.
+    let Some(declared) = psbt.inputs[index].sighash_type else {
+        return Ok(());
+    };
+    let taproot = declared
+        .taproot_hash_ty()
+        .map_err(|_| anyhow::anyhow!("PSBT input {index} requests a non-Taproot sighash type"))?;
+    if taproot != TapSighashType::Default {
+        bail!("PSBT input {index} requests the non-default Taproot sighash {taproot}");
+    }
+    Ok(())
+}
+
 pub fn sign_vault_psbt(
     psbt: &mut Psbt,
     policy: &VaultPolicy,
@@ -45,6 +65,7 @@ pub fn sign_vault_psbt(
     let leaf = policy.leaf(path)?;
 
     for index in 0..psbt.inputs.len() {
+        ensure_default_sighash(psbt, index)?;
         let origins = psbt.inputs[index]
             .tap_key_origins
             .get(&signing_pubkey)
@@ -82,6 +103,10 @@ pub fn verify_vault_psbt_signature(
     let secp = Secp256k1::verification_only();
     let leaf = policy.leaf(path)?;
     for index in 0..psbt.inputs.len() {
+        // The stored label below is written by us and is always Default, so checking it alone
+        // proves nothing. The binding property comes from the sighash the message was built
+        // over, which is what this checks.
+        ensure_default_sighash(psbt, index)?;
         let signature = psbt.inputs[index]
             .tap_script_sigs
             .get(&(signing_pubkey, leaf.leaf_hash))
