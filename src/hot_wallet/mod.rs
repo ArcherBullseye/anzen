@@ -769,8 +769,9 @@ impl HotWalletBackend for ElectrumBackend {
 }
 
 impl HotAddressProvider for HotWallet {
-    fn next_receive_address(&mut self) -> Result<bitcoin::Address> {
-        HotWallet::next_receive_address(self)
+    fn next_receive_address(&mut self) -> Result<ceremony::HotAddress> {
+        let (address, index) = HotWallet::next_receive_address_with_index(self)?;
+        Ok(ceremony::HotAddress { address, index })
     }
 }
 

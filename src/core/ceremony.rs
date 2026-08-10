@@ -45,6 +45,8 @@ pub struct MonthPair {
     pub chunk_vout: u32,
     pub chunk_value_sats: u64,
     pub hot_address: String,
+    /// Derivation index of `hot_address` in the phone's external hot descriptor.
+    pub hot_address_index: u32,
     pub authorization: BatchTransaction,
     pub revocation: BatchTransaction,
 }
@@ -55,6 +57,8 @@ pub struct EmergencyAccessPolicy {
     pub delay_seconds: u32,
     pub delay_sequence: u32,
     pub hot_address: String,
+    /// Derivation index of `hot_address` in the phone's external hot descriptor.
+    pub hot_address_index: u32,
     pub staging_vout: u32,
     pub staging_value_sats: u64,
     pub vault_change_vout: u32,
@@ -165,9 +169,18 @@ pub struct PolicyPackage {
     pub psbts: BTreeMap<String, String>,
 }
 
+/// One freshly revealed hot-wallet receive address, with the derivation index it came from.
+///
+/// The index is recorded in the policy manifest so the hardware wallet can re-derive the address
+/// from the phone's hot descriptor instead of taking the proposed address on trust.
+pub struct HotAddress {
+    pub address: Address,
+    pub index: u32,
+}
+
 /// Supplies fresh phone receive addresses without coupling the protocol rules to a wallet SDK.
 pub trait HotAddressProvider {
-    fn next_receive_address(&mut self) -> Result<Address>;
+    fn next_receive_address(&mut self) -> Result<HotAddress>;
 }
 
 pub fn default_batch_path(data_dir: &Path) -> PathBuf {
@@ -183,7 +196,7 @@ pub fn package_from_batch(batch_dir: &Path) -> Result<PolicyPackage> {
         psbts.insert(transaction.psbt_file.clone(), text.trim().to_owned());
     }
     Ok(PolicyPackage {
-        version: 3,
+        version: 4,
         kind: POLICY_PACKAGE_KIND.to_owned(),
         manifest,
         psbts,
@@ -191,7 +204,7 @@ pub fn package_from_batch(batch_dir: &Path) -> Result<PolicyPackage> {
 }
 
 pub fn is_supported_policy_package(package: &PolicyPackage) -> bool {
-    package.version == 3 && package.kind == POLICY_PACKAGE_KIND
+    package.version == 4 && package.kind == POLICY_PACKAGE_KIND
 }
 
 pub fn materialize_policy_package(package: &PolicyPackage, batch_dir: &Path) -> Result<()> {
@@ -263,9 +276,11 @@ pub fn build_policy_proposal(
         .map(|utxo| vault_input(utxo.outpoint, Sequence::MAX))
         .collect::<Vec<_>>();
 
-    let emergency_hot_address = (emergency_access_limit_sats > 0)
+    let emergency_hot = (emergency_access_limit_sats > 0)
         .then(|| hot.next_receive_address())
         .transpose()?;
+    let emergency_hot_index = emergency_hot.as_ref().map(|revealed| revealed.index);
+    let emergency_hot_address = emergency_hot.map(|revealed| revealed.address);
     let emergency_delay_sequence = emergency_delay_sequence()?;
     let emergency_staging_value_sats = match &emergency_hot_address {
         Some(address) => {
@@ -391,7 +406,8 @@ pub fn build_policy_proposal(
     let month_starts = next_month_starts(now, chunk_count)?;
     let mut months = Vec::with_capacity(chunk_count);
     for (index, (month, unlock_timestamp)) in month_starts.into_iter().enumerate() {
-        let hot_address = hot.next_receive_address()?;
+        let revealed = hot.next_receive_address()?;
+        let (hot_address, hot_address_index) = (revealed.address, revealed.index);
         let chunk_outpoint = OutPoint::new(rollover_txid, index as u32);
         let authorization_fee = authorization_fee(
             &policy,
@@ -452,6 +468,7 @@ pub fn build_policy_proposal(
             chunk_vout: index as u32,
             chunk_value_sats: chunk_value,
             hot_address: hot_address.to_string(),
+            hot_address_index,
             authorization: BatchTransaction {
                 psbt_file: authorization_file,
                 unsigned_txid: authorization_tx.compute_txid().to_string(),
@@ -476,6 +493,7 @@ pub fn build_policy_proposal(
                 emergency_access_limit_sats,
                 emergency_delay_sequence,
                 &hot_address,
+                emergency_hot_index.context("emergency hot address index is missing")?,
                 vault_script.clone(),
                 batch_dir,
                 phone,
@@ -485,7 +503,7 @@ pub fn build_policy_proposal(
     };
 
     let manifest = BatchManifest {
-        version: 3,
+        version: 4,
         created_at: now.timestamp(),
         network: config.network.clone(),
         vault_descriptor: config.vault_descriptor.clone(),
@@ -520,7 +538,7 @@ pub fn validate_batch(
     manifest: &BatchManifest,
     batch_dir: &Path,
 ) -> Result<VaultPolicy> {
-    if manifest.version != 3 || manifest.network != config.network {
+    if manifest.version != 4 || manifest.network != config.network {
         bail!("unsupported ceremony manifest or network mismatch");
     }
     if manifest.vault_descriptor != config.vault_descriptor
@@ -591,9 +609,19 @@ pub fn validate_batch(
             bail!("month {} does not match its rollover chunk", month.month);
         }
         let expected_outpoint = OutPoint::new(rollover_tx.compute_txid(), index as u32);
-        let hot_script = Address::from_str(&month.hot_address)?
-            .require_network(config.bitcoin_network()?)?
-            .script_pubkey();
+        // Re-derive the payout address from the phone's public hot descriptor instead of
+        // trusting month.hot_address, which arrives in the proposal. The index is only a lookup
+        // hint and may be anything: if it does not reproduce the proposed address, this fails.
+        let expected_hot = config.hot_address_at(month.hot_address_index)?;
+        if expected_hot.to_string() != month.hot_address {
+            bail!(
+                "monthly authorization {} pays {}, which is not the phone's hot address at index {}",
+                month.month,
+                month.hot_address,
+                month.hot_address_index
+            );
+        }
+        let hot_script = expected_hot.script_pubkey();
         let authorization = read_psbt(&batch_dir.join(&month.authorization.psbt_file))?;
         validate_child_common(
             &authorization,
@@ -676,9 +704,16 @@ fn validate_emergency_access(
     {
         bail!("emergency access metadata violates the approved policy");
     }
-    let hot_script = Address::from_str(&emergency.hot_address)?
-        .require_network(config.bitcoin_network()?)?
-        .script_pubkey();
+    // Same re-derivation for the emergency payout, which is not bounded by the monthly limit.
+    let expected_hot = config.hot_address_at(emergency.hot_address_index)?;
+    if expected_hot.to_string() != emergency.hot_address {
+        bail!(
+            "emergency withdrawal pays {}, which is not the phone's hot address at index {}",
+            emergency.hot_address,
+            emergency.hot_address_index
+        );
+    }
+    let hot_script = expected_hot.script_pubkey();
     let vault_script = policy.address.script_pubkey();
     let remainder_index = manifest.remainder_vout as usize;
     let source_outpoint =
@@ -801,6 +836,7 @@ fn build_emergency_access(
     amount_sats: u64,
     delay_sequence: Sequence,
     hot_address: &Address,
+    hot_address_index: u32,
     vault_script: ScriptBuf,
     batch_dir: &Path,
     phone: &DeviceKeys,
@@ -908,6 +944,7 @@ fn build_emergency_access(
         delay_seconds: EMERGENCY_ACCESS_DELAY_SECONDS,
         delay_sequence: delay_sequence.to_consensus_u32(),
         hot_address: hot_address.to_string(),
+        hot_address_index,
         staging_vout: 0,
         staging_value_sats,
         vault_change_vout: 1,
@@ -1604,7 +1641,7 @@ mod tests {
         let imported = dir.path().join("imported");
         materialize_policy_package(&package, &imported).unwrap();
         validate_batch(&initialized.config, &package.manifest, &imported).unwrap();
-        assert_eq!(package.version, 3);
+        assert_eq!(package.version, 4);
         assert_eq!(package.psbts.len(), 25);
 
         let mut legacy = package.clone();

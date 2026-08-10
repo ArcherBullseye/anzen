@@ -50,12 +50,18 @@ impl HotWallet {
     }
 
     pub fn next_receive_address(&mut self) -> Result<Address> {
-        let address = self
-            .wallet
-            .reveal_next_address(KeychainKind::External)
-            .address;
+        Ok(self.next_receive_address_with_index()?.0)
+    }
+
+    /// Reveal the next external address together with its derivation index.
+    ///
+    /// The index travels in the policy manifest so the hardware wallet can re-derive the address
+    /// from the phone's public hot descriptor rather than trusting the proposed string.
+    pub fn next_receive_address_with_index(&mut self) -> Result<(Address, u32)> {
+        let info = self.wallet.reveal_next_address(KeychainKind::External);
+        let revealed = (info.address, info.index);
         self.wallet.persist(&mut self.db)?;
-        Ok(address)
+        Ok(revealed)
     }
 
     pub fn next_change_address(&mut self) -> Result<Address> {

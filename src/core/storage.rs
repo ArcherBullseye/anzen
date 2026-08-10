@@ -37,6 +37,24 @@ impl VaultConfig {
     pub fn bitcoin_network(&self) -> Result<Network> {
         parse_network_name(&self.network)
     }
+
+    /// Derive the phone's external hot-wallet address at `index`.
+    ///
+    /// The config stores the phone's *public* hot descriptor, so the hardware wallet can check
+    /// for itself that a proposed payout address really belongs to the phone instead of trusting
+    /// the address string in a proposal. This needs only Miniscript, so it does not breach the
+    /// rule that `cold_wallet` never depends on `hot_wallet`.
+    pub fn hot_address_at(&self, index: u32) -> Result<bitcoin::Address> {
+        let descriptor = miniscript::Descriptor::<miniscript::DescriptorPublicKey>::from_str(
+            &self.phone_hot_external_descriptor,
+        )
+        .context("vault config has an invalid phone hot descriptor")?;
+        descriptor
+            .at_derivation_index(index)
+            .context("hot address derivation index is out of range")?
+            .address(self.bitcoin_network()?)
+            .context("phone hot descriptor does not produce an address")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
