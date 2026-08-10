@@ -22,6 +22,11 @@ use pgp::{
 };
 use rand::thread_rng;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
+
+/// Upper bound on the plaintext read out of a friend's key wrapper. The real payload is a
+/// 32-byte symmetric key; anything at or above this is refused without being expanded.
+const MAX_WRAPPED_KEY_BYTES: u64 = 64;
 
 const PAYLOAD_PURPOSE: &str = "cloud/vault-recovery-payload/v1";
 const HWW_KEY_PURPOSE: &str = "cloud/vault-recovery-key/hww/v1";
@@ -207,9 +212,18 @@ pub fn decrypt_with_friend(
             .decompress()
             .context("failed to decompress friend recovery key message")?;
     }
-    let symmetric_key = message
-        .as_data_vec()
-        .context("friend recovery key message contained no data")?;
+    // This wrapper only ever carries a 32-byte symmetric key, so read it under a bound rather
+    // than to end of stream. A compromised cloud holds this friend's public key - it is stored
+    // in the very wrapper the cloud controls - so it can encrypt a compressed bomb to that key.
+    // `as_data_vec` is an unbounded `read_to_end`, and none of the checks below run until it has
+    // finished, so an unbounded read expands the whole payload before anything is authenticated.
+    let mut symmetric_key = Vec::new();
+    std::io::Read::take(&mut message, MAX_WRAPPED_KEY_BYTES)
+        .read_to_end(&mut symmetric_key)
+        .context("friend recovery key message could not be read")?;
+    if symmetric_key.len() as u64 >= MAX_WRAPPED_KEY_BYTES {
+        bail!("friend recovery wrapper is larger than a symmetric key; refusing to expand it");
+    }
     if symmetric_key.len() != 32 {
         bail!("friend recovery wrapper contains an invalid symmetric key");
     }
@@ -541,5 +555,73 @@ mod tests {
             recovery::sign_recovery_sweep(plan, SweepPath::PhoneRecovery, &recovered_phone)
                 .unwrap();
         assert_eq!(result.input_count, 1);
+    }
+
+    /// A compromised cloud holds each friend's public key, because it is stored in the wrapper
+    /// the cloud controls. It can therefore encrypt anything it likes to that key. This measures
+    /// what `decrypt_with_friend` does with a highly compressible payload.
+    #[test]
+    fn a_compressed_bomb_in_a_friend_wrapper_is_not_expanded() {
+        use pgp::crypto::sym::SymmetricKeyAlgorithm;
+        use pgp::types::CompressionAlgorithm;
+
+        let dir = tempfile::tempdir().unwrap();
+        let initialized = initialize(dir.path()).unwrap();
+        let phone = crate::core::storage::load_device_keys(
+            dir.path(),
+            crate::core::storage::PHONE_DEVICE_FILE,
+        )
+        .unwrap();
+        let hww = crate::core::storage::load_device_keys(
+            dir.path(),
+            crate::core::storage::HWW_DEVICE_FILE,
+        )
+        .unwrap();
+        let friend = generate_friend_key("bombed").unwrap();
+        let payload = RecoveryPayload::new(&initialized.config, &phone).unwrap();
+        let mut backup = create_backup(
+            &payload,
+            &hww.seed,
+            std::slice::from_ref(&friend.public_key_armored),
+        )
+        .unwrap();
+
+        // 64 MiB of zeros, ZIP-compressed and encrypted to the friend's own encryption subkey.
+        const BOMB_BYTES: usize = 64 * 1024 * 1024;
+        let (public, _) =
+            SignedPublicKey::from_reader_single(friend.public_key_armored.as_bytes()).unwrap();
+        let encryption_subkey = public
+            .public_subkeys
+            .iter()
+            .find(|subkey| subkey.is_encryption_key())
+            .unwrap();
+        let mut builder = MessageBuilder::from_bytes("bomb", vec![0_u8; BOMB_BYTES])
+            .seipd_v1(thread_rng(), SymmetricKeyAlgorithm::AES256);
+        builder.compression(CompressionAlgorithm::ZIP);
+        builder
+            .encrypt_to_key(thread_rng(), encryption_subkey)
+            .unwrap();
+        let bomb = builder.to_vec(thread_rng()).unwrap();
+
+        println!(
+            "bomb wrapper: {} bytes on the wire, {} bytes when expanded ({}x)",
+            bomb.len(),
+            BOMB_BYTES,
+            BOMB_BYTES / bomb.len().max(1)
+        );
+        backup.friends[0].encrypted_symmetric_key = STANDARD.encode(&bomb);
+
+        let started = std::time::Instant::now();
+        let result = decrypt_with_friend(&backup, friend.private_key_armored.as_bytes());
+        let elapsed = started.elapsed();
+        match &result {
+            Ok(_) => println!("bomb ACCEPTED"),
+            Err(error) => println!("rejected in {elapsed:?}: {error:#}"),
+        }
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(
+            message.contains("refusing to expand it"),
+            "the bomb must be refused under the read bound, not after being expanded; got: {message}"
+        );
     }
 }
